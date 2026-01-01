@@ -58,6 +58,7 @@ function isOnCooldown(command, userId) {
   const now = Date.now();
   return now < expiresAt ? Math.ceil((expiresAt - now) / 1000) : 0;
 }
+
 function setCooldown(command, userId, ms = DEFAULT_COOLDOWN_MS) {
   if (!cooldowns[command]) cooldowns[command] = {};
   cooldowns[command][userId] = Date.now() + ms;
@@ -76,6 +77,7 @@ function getUserDiscount(channel, userId) {
   if (now - entry.createdAt > DISCOUNT_LIFETIME_MS) return null;
   return entry;
 }
+
 function setUserDiscount(channel, userId, code) {
   if (!claimedDiscounts[channel]) claimedDiscounts[channel] = {};
   claimedDiscounts[channel][userId] = { code, createdAt: Date.now() };
@@ -98,8 +100,18 @@ async function callBackend(path, method = "POST", body = {}) {
     method,
     data: body,
     headers: { "Content-Type": "application/json" },
+    validateStatus: () => true, // <-- do NOT throw on non-2xx (we handle it)
   });
-  return res.data;
+
+  // Return the backend json if present, otherwise construct a fallback
+  if (typeof res.data === "object" && res.data !== null) return res.data;
+
+  return {
+    ok: false,
+    error: `Backend returned HTTP ${res.status}`,
+    status: res.status,
+    raw: res.data,
+  };
 }
 
 /**
@@ -164,6 +176,11 @@ const COMMANDS = {
         }
 
         if (!result.ok) {
+          // If backend ever adds plan_limit for viewer codes, handle it cleanly
+          if (result.reason === "plan_limit" && result.message) {
+            return client.say(channel, `@${username} ${result.message}`);
+          }
+
           // Use backend reason codes
           switch (result.reason) {
             case "disabled":
@@ -184,7 +201,7 @@ const COMMANDS = {
                 } seconds.`
               );
             case "limit_reached": {
-              // 👉 IMPORTANT: try to re-show their last code if we have it cached
+              // try to re-show their last code if we have it cached
               const existing = getUserDiscount(channel, userId);
               if (existing?.code) {
                 return client.say(
@@ -220,13 +237,13 @@ const COMMANDS = {
         // Set bot-side cooldown (separate from backend cooldown)
         setCooldown("discount", userId, COMMAND_COOLDOWNS.discount);
 
-        await client.say(
+        return client.say(
           channel,
           `🎁 @${username} your code: ${code} — valid for ~10 minutes!`
         );
       } catch (err) {
-        console.error("Viewer discount error:", err.response?.data || err);
-        await client.say(
+        console.error("Viewer discount error:", err?.response?.data || err);
+        return client.say(
           channel,
           `@${username} something went wrong while generating your discount.`
         );
@@ -281,8 +298,17 @@ const COMMANDS = {
           { percent }
         );
 
-        if (!data.ok) {
-          console.error("Global drop backend error:", data);
+        // Plan limit message (or any explicit backend reason)
+        if (!data?.ok) {
+          if (data?.reason === "plan_limit" && data?.message) {
+            return client.say(channel, `@${username} ${data.message}`);
+          }
+
+          // Optional: surface backend error if present
+          if (data?.error) {
+            return client.say(channel, `@${username} ${data.error}`);
+          }
+
           return client.say(
             channel,
             `@${username} could not create a global drop (Shopify not configured?).`
@@ -292,16 +318,18 @@ const COMMANDS = {
         const code = data.drop.code;
         lastGlobalDropAt = Date.now();
 
-        await client.say(
+        return client.say(
           channel,
-          `🔥 GLOBAL DROP ACTIVATED!\n` +
-            `🎁 Code: ${code}\n` +
-            `💸 ${percent}% OFF for the next 10 minutes!\n` +
-            `⏳ Use it before it expires!`
+          `🔥 GLOBAL DROP ACTIVATED! 🎁 Code: ${code} 💸 ${percent}% OFF for the next 10 minutes ⏳`
         );
       } catch (err) {
-        console.error("Global drop error:", err.response?.data || err);
-        await client.say(
+        const payload = err?.response?.data;
+        if (payload?.reason === "plan_limit" && payload?.message) {
+          return client.say(channel, `@${username} ${payload.message}`);
+        }
+
+        console.error("Global drop error:", payload || err);
+        return client.say(
           channel,
           `@${username} something went wrong creating the drop.`
         );
@@ -320,7 +348,7 @@ const COMMANDS = {
           `@${tags["display-name"]} You are not allowed to use this command.`
         );
       }
-      await client.say(channel, `Config reloaded (demo).`);
+      return client.say(channel, `Config reloaded (demo).`);
     },
   },
 };
@@ -334,9 +362,9 @@ client.connect().catch((err) => {
 
 client.on("connected", async (addr, port) => {
   console.log(`[INFO] Connected to ${addr}:${port}`);
-  console.log(`[INFO] Static channels from .env: ${channels
-    .map((c) => "#" + c)
-    .join(", ")}`);
+  console.log(
+    `[INFO] Static channels from .env: ${channels.map((c) => "#" + c).join(", ")}`
+  );
 
   // Auto-join active streamers from backend
   try {
@@ -403,13 +431,12 @@ client.on("message", async (channel, tags, message, self) => {
     await command.execute(channel, tags, args);
 
     if (commandName !== "discount") {
-      const customCd =
-        COMMAND_COOLDOWNS[commandName] || DEFAULT_COOLDOWN_MS;
+      const customCd = COMMAND_COOLDOWNS[commandName] || DEFAULT_COOLDOWN_MS;
       setCooldown(commandName, userId, customCd);
     }
   } catch (err) {
     console.error(`[ERROR] Command ${commandName} failed:`, err);
-    await client.say(
+    return client.say(
       channel,
       `@${username} something went wrong executing ${COMMAND_PREFIX}${commandName}.`
     );
