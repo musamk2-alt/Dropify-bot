@@ -42,6 +42,65 @@ const client = new tmi.Client({
   channels,
 });
 
+/**
+ * Track joined channels to prevent duplicate joins
+ * (tmi expects channel names without '#')
+ */
+const joinedChannels = new Set(channels);
+
+/**
+ * Join polling interval handle
+ */
+let autoJoinInterval = null;
+
+/**
+ * Small delay between joins to avoid Twitch join rate limits
+ */
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Fetch active channels from backend and join missing ones
+ */
+async function syncJoinsFromBackend() {
+  try {
+    const res = await axios.get(`${BACKEND_URL}/api/streamers/active`, {
+      timeout: 10_000,
+      validateStatus: () => true,
+    });
+
+    const data = res.data;
+
+    if (!data || data.ok !== true || !Array.isArray(data.channels)) {
+      console.warn("[AUTOJOIN] Unexpected response from backend:", data);
+      return;
+    }
+
+    const list = data.channels
+      .map((c) => String(c || "").trim().toLowerCase())
+      .filter(Boolean);
+
+    if (!list.length) return;
+
+    for (const ch of list) {
+      if (joinedChannels.has(ch)) continue;
+
+      console.log(`[AUTOJOIN] Joining channel: ${ch}`);
+      try {
+        await client.join(ch);
+        joinedChannels.add(ch);
+        // spacing joins avoids rate limits / join floods
+        await sleep(900);
+      } catch (e) {
+        console.error(`[AUTOJOIN] Failed to join ${ch}:`, e?.message || e);
+      }
+    }
+  } catch (err) {
+    console.error("[AUTOJOIN] Error talking to backend:", err?.message || err);
+  }
+}
+
 // ---- GLOBAL DROP COOLDOWN ----
 let lastGlobalDropAt = 0;
 const GLOBAL_DROP_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
@@ -100,10 +159,9 @@ async function callBackend(path, method = "POST", body = {}) {
     method,
     data: body,
     headers: { "Content-Type": "application/json" },
-    validateStatus: () => true, // <-- do NOT throw on non-2xx (we handle it)
+    validateStatus: () => true, // do NOT throw on non-2xx
   });
 
-  // Return the backend json if present, otherwise construct a fallback
   if (typeof res.data === "object" && res.data !== null) return res.data;
 
   return {
@@ -138,7 +196,7 @@ const COMMANDS = {
     },
   },
 
-  // PERSONAL VIEWER DISCOUNT -> new Dropify API with code recall
+  // PERSONAL VIEWER DISCOUNT
   discount: {
     description: "Get a personal discount code.",
     execute: async (channel, tags) => {
@@ -146,7 +204,6 @@ const COMMANDS = {
       const userId = tags["user-id"] || username.toLowerCase();
       const twitchLogin = channel.replace("#", "").toLowerCase();
 
-      // bot-side cooldown (to avoid spam calling the API)
       const cd = isOnCooldown("discount", userId);
       if (cd > 0) {
         return client.say(
@@ -176,12 +233,10 @@ const COMMANDS = {
         }
 
         if (!result.ok) {
-          // If backend ever adds plan_limit for viewer codes, handle it cleanly
           if (result.reason === "plan_limit" && result.message) {
             return client.say(channel, `@${username} ${result.message}`);
           }
 
-          // Use backend reason codes
           switch (result.reason) {
             case "disabled":
               return client.say(
@@ -201,7 +256,6 @@ const COMMANDS = {
                 } seconds.`
               );
             case "limit_reached": {
-              // try to re-show their last code if we have it cached
               const existing = getUserDiscount(channel, userId);
               if (existing?.code) {
                 return client.say(
@@ -228,13 +282,9 @@ const COMMANDS = {
           }
         }
 
-        // ✅ SUCCESS – backend generated a new code
         const code = result.discountCode;
 
-        // Cache the code so user can see it again later
         setUserDiscount(channel, userId, code);
-
-        // Set bot-side cooldown (separate from backend cooldown)
         setCooldown("discount", userId, COMMAND_COOLDOWNS.discount);
 
         return client.say(
@@ -251,7 +301,7 @@ const COMMANDS = {
     },
   },
 
-  // GLOBAL DROP -> backend /global (streamer only)
+  // GLOBAL DROP
   drop: {
     description: "Create a global stream-wide discount (streamer only).",
     execute: async (channel, tags, args) => {
@@ -298,13 +348,11 @@ const COMMANDS = {
           { percent }
         );
 
-        // Plan limit message (or any explicit backend reason)
         if (!data?.ok) {
           if (data?.reason === "plan_limit" && data?.message) {
             return client.say(channel, `@${username} ${data.message}`);
           }
 
-          // Optional: surface backend error if present
           if (data?.error) {
             return client.say(channel, `@${username} ${data.error}`);
           }
@@ -348,7 +396,11 @@ const COMMANDS = {
           `@${tags["display-name"]} You are not allowed to use this command.`
         );
       }
-      return client.say(channel, `Config reloaded (demo).`);
+
+      // immediate sync + keep running interval
+      await client.say(channel, `Reloading channel list…`);
+      await syncJoinsFromBackend();
+      return client.say(channel, `Channel list synced ✅`);
     },
   },
 };
@@ -363,37 +415,29 @@ client.connect().catch((err) => {
 client.on("connected", async (addr, port) => {
   console.log(`[INFO] Connected to ${addr}:${port}`);
   console.log(
-    `[INFO] Static channels from .env: ${channels.map((c) => "#" + c).join(", ")}`
+    `[INFO] Static channels from .env: ${channels.map((c) => "#" + c).join(", ") || "(none)"}`
   );
 
-  // Auto-join active streamers from backend
-  try {
-    console.log("[AUTOJOIN] Fetching channels from backend...");
-    const res = await axios.get(`${BACKEND_URL}/api/streamers/active`);
-    const data = res.data;
+  // Initial join sync
+  console.log("[AUTOJOIN] Initial sync...");
+  await syncJoinsFromBackend();
 
-    if (data.ok && Array.isArray(data.channels)) {
-      console.log(
-        `[AUTOJOIN] Backend returned ${data.channels.length} channel(s):`,
-        data.channels
-      );
+  // Start polling auto-join (only one interval)
+  if (autoJoinInterval) clearInterval(autoJoinInterval);
+  autoJoinInterval = setInterval(() => {
+    syncJoinsFromBackend().catch(() => {});
+  }, 60 * 1000);
 
-      for (const ch of data.channels) {
-        if (!channels.includes(ch)) {
-          console.log(`[AUTOJOIN] Joining channel: ${ch}`);
-          await client.join(ch);
-        }
-      }
-    } else {
-      console.warn("[AUTOJOIN] Unexpected response from backend:", data);
-    }
-  } catch (err) {
-    console.error("[AUTOJOIN] Error talking to backend:", err.message || err);
-  }
+  console.log("[AUTOJOIN] Polling enabled (every 60s).");
 });
 
 client.on("disconnected", (reason) => {
   console.warn("[WARN] Disconnected from Twitch:", reason);
+
+  if (autoJoinInterval) {
+    clearInterval(autoJoinInterval);
+    autoJoinInterval = null;
+  }
 });
 
 /**
@@ -418,7 +462,6 @@ client.on("message", async (channel, tags, message, self) => {
 
   const userId = tags["user-id"] || username.toLowerCase();
 
-  // all commands except discount use global cooldown handler
   const cd = isOnCooldown(commandName, userId);
   if (cd > 0 && commandName !== "discount") {
     return client.say(
